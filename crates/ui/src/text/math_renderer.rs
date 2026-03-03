@@ -7,7 +7,10 @@
 use std::sync::OnceLock;
 
 use chrono::{Datelike, Timelike};
-use gpui::{AnyElement, App, IntoElement, ObjectFit, Styled, StyledImage as _, Window, img};
+use gpui::{
+    AnyElement, App, IntoElement, ObjectFit, ParentElement as _, Pixels, Styled, StyledImage as _,
+    Window, div, img, px,
+};
 use typst::foundations::{Bytes, Datetime};
 use typst::layout::PagedDocument;
 use typst::syntax::{FileId, Source, VirtualPath};
@@ -233,6 +236,36 @@ fn replace_matrix_env(input: &str, env_name: &str, delim_str: &str) -> String {
 //  Step 2: Typst formula → SVG string (via typst + typst-svg)
 // ---------------------------------------------------------------------------
 
+/// Parsed dimensions from an SVG element (in pt).
+#[derive(Debug, Clone, Copy)]
+struct SvgDimensions {
+    width_pt: f32,
+    height_pt: f32,
+}
+
+/// Parse width/height from typst-svg output like `width="88.06pt" height="16.52pt"`.
+fn parse_svg_dimensions(svg: &str) -> Option<SvgDimensions> {
+    // typst-svg always emits `width="...pt"` and `height="...pt"` on the root <svg>.
+    let width_pt = parse_svg_attr(svg, "width")?;
+    let height_pt = parse_svg_attr(svg, "height")?;
+    Some(SvgDimensions {
+        width_pt,
+        height_pt,
+    })
+}
+
+/// Extract a numeric `pt` attribute value from the SVG tag, e.g. `width="88.06pt"` → 88.06.
+fn parse_svg_attr(svg: &str, attr_name: &str) -> Option<f32> {
+    let pattern = format!("{}=\"", attr_name);
+    let start = svg.find(&pattern)? + pattern.len();
+    let rest = &svg[start..];
+    let end = rest.find('"')?;
+    let value_str = &rest[..end];
+    // Strip trailing "pt" unit if present
+    let numeric = value_str.trim_end_matches("pt");
+    numeric.parse::<f32>().ok()
+}
+
 /// Compile a Typst formula expression and render the first page to SVG.
 ///
 /// `formula` should be a complete Typst math expression, e.g. `$ E = m c^2 $`.
@@ -277,12 +310,31 @@ pub fn latex_to_svg(latex: &str, font_size: f32) -> Result<String, String> {
 //  GPUI integration: SVG string → RenderImage → AnyElement
 // ---------------------------------------------------------------------------
 
-/// The default font size (in pt) used when rendering math formulas.
-const DEFAULT_MATH_FONT_SIZE: f32 = 16.0;
+/// The SVG rasterisation scale factor.
+/// `render_single_frame` additionally multiplies by GPUI's internal
+/// `SMOOTH_SVG_SCALE_FACTOR` (2.0), so the effective pixel multiplier
+/// is `SVG_RENDER_SCALE × 2.0`.  A value of 2.0 here gives 4× super-
+/// sampling which keeps formulas crisp on HiDPI screens.
+const SVG_RENDER_SCALE: f32 = 2.0;
 
-/// The default scale factor for SVG → pixel rendering.
-/// Higher values produce crisper output on HiDPI displays.
-const DEFAULT_SVG_SCALE: f32 = 2.0;
+/// Convert the current UI text font-size into a Typst `pt` value.
+///
+/// GPUI's `Pixels` map 1-to-1 to CSS `px`.
+/// 1 CSS pt = 4/3 CSS px  ⟹  1 CSS px = 3/4 CSS pt.
+fn text_size_to_typst_pt(window: &Window) -> f32 {
+    let text_size_px: Pixels = window.text_style().font_size.to_pixels(window.rem_size());
+    // Pixels / Pixels → f32
+    let px_value: f32 = text_size_px / px(1.0);
+    // We pass the px value directly as the Typst pt size.
+    // Typst's `pt` is slightly larger than CSS `px` (1pt = 4/3 px), so using
+    // the px value as-is makes the compiled formula ~33% larger in pt-space,
+    // which perfectly compensates for the pt→px shrink when we later convert
+    // the SVG dimensions back to display pixels (width_pt * PT_TO_PX).
+    px_value
+}
+
+/// Conversion factor from typst `pt` to CSS `px` (1 pt = 4/3 px).
+const PT_TO_PX: f32 = 4.0 / 3.0;
 
 /// Render a LaTeX math string into a GPUI `AnyElement`.
 ///
@@ -297,12 +349,15 @@ const DEFAULT_SVG_SCALE: f32 = 2.0;
 /// (the caller should fall back to showing the raw source).
 pub fn render_math_to_element(
     latex: &str,
-    _display: bool,
-    _window: &mut Window,
+    display: bool,
+    window: &mut Window,
     cx: &mut App,
 ) -> Option<AnyElement> {
-    // 1. LaTeX → SVG string
-    let svg_string = match latex_to_svg(latex, DEFAULT_MATH_FONT_SIZE) {
+    // 1. Compile at the *target* font size so the SVG is natively the
+    //    correct size — no post-hoc scaling needed, maximum sharpness.
+    let target_pt = text_size_to_typst_pt(window);
+
+    let svg_string = match latex_to_svg(latex, target_pt) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("math render failed: {}", e);
@@ -310,12 +365,15 @@ pub fn render_math_to_element(
         }
     };
 
-    // 2. SVG bytes → RenderImage via GPUI's built-in resvg pipeline
+    // 2. Parse the SVG's intrinsic dimensions (in pt).
+    let svg_dims = parse_svg_dimensions(&svg_string);
+
+    // 3. SVG bytes → RenderImage (high-res rasterisation).
     let svg_renderer = cx.svg_renderer();
     let render_image = match svg_renderer.render_single_frame(
         svg_string.as_bytes(),
-        DEFAULT_SVG_SCALE,
-        true, // convert to BGRA (required for GPU upload)
+        SVG_RENDER_SCALE,
+        true, // convert to BGRA for GPU upload
     ) {
         Ok(image) => image,
         Err(e) => {
@@ -324,13 +382,62 @@ pub fn render_math_to_element(
         }
     };
 
-    // 3. Build an img() element from the in-memory RenderImage
-    let element = img(render_image)
-        .object_fit(ObjectFit::Contain)
-        .flex_shrink_0()
-        .into_any_element();
+    // 4. Display dimensions — convert typst's pt values to CSS px.
+    //    1 typst pt = 4/3 CSS px.  We compiled at a pt size equal to
+    //    the UI's px font size, so multiplying by PT_TO_PX gives us
+    //    display dimensions that match the surrounding text correctly.
+    let (display_w, display_h) = if let Some(dims) = svg_dims {
+        (px(dims.width_pt * PT_TO_PX), px(dims.height_pt * PT_TO_PX))
+    } else {
+        // Fallback: derive from pixel buffer size.
+        let pixel_size = render_image.size(0);
+        let total_scale = SVG_RENDER_SCALE * 2.0; // × SMOOTH_SVG_SCALE_FACTOR
+        (
+            px(pixel_size.width.0 as f32 / total_scale),
+            px(pixel_size.height.0 as f32 / total_scale),
+        )
+    };
 
-    Some(element)
+    // 5. Build the img element.
+    let img_el = img(render_image)
+        .object_fit(ObjectFit::Fill)
+        .flex_shrink_0()
+        .w(display_w)
+        .h(display_h);
+
+    // 6. Vertical alignment for inline math.
+    //    Inline formulas sit inside a flex row with `items_baseline`.
+    //    A bare img has its baseline at the bottom edge, which pushes the
+    //    formula below the text.  We wrap it in a div and shift it down
+    //    with a negative margin-bottom so the formula's visual centre
+    //    aligns with the text midline.
+    if display {
+        // Block / display math — centre horizontally with some vertical padding.
+        Some(
+            div()
+                .flex_shrink_0()
+                .py(px(4.0))
+                .child(img_el)
+                .into_any_element(),
+        )
+    } else {
+        // Inline math — the image baseline is at its bottom edge, but the
+        // formula's visual baseline sits higher (descenders like subscripts
+        // extend below it).  We use a negative margin-bottom to pull the
+        // image upward so the formula's baseline aligns with the text.
+        //
+        // Heuristic: the descender portion is roughly 20-25% of the total
+        // formula height for typical inline expressions.  We shift up by
+        // that amount.
+        let descent = display_h * 0.2;
+        Some(
+            div()
+                .flex_shrink_0()
+                .mb(-descent)
+                .child(img_el)
+                .into_any_element(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -359,6 +466,20 @@ mod tests {
         let svg = result.unwrap();
         assert!(svg.contains("<svg"), "output should be SVG markup");
         assert!(svg.contains("</svg>"), "output should be complete SVG");
+    }
+
+    #[test]
+    fn test_parse_svg_dimensions() {
+        let svg = r#"<svg class="typst-doc" viewBox="0 0 88.06 16.52" width="88.06240000000001pt" height="16.5248pt" xmlns="http://www.w3.org/2000/svg">"#;
+        let dims = parse_svg_dimensions(svg).expect("should parse dimensions");
+        assert!((dims.width_pt - 88.062).abs() < 0.1);
+        assert!((dims.height_pt - 16.52).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_parse_svg_dimensions_none_on_bad_input() {
+        assert!(parse_svg_dimensions("not svg").is_none());
+        assert!(parse_svg_dimensions(r#"<svg width="bad" height="100pt">"#).is_none());
     }
 
     #[test]
