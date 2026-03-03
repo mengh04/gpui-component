@@ -9,8 +9,8 @@ use crate::{
     text::{
         document::ParsedDocument,
         node::{
-            self, BlockNode, CodeBlock, ImageNode, InlineNode, LinkMark, NodeContext, Paragraph,
-            Span, Table, TableRow, TextMark,
+            self, BlockNode, CodeBlock, ImageNode, InlineNode, LinkMark, MathNode, NodeContext,
+            Paragraph, Span, Table, TableRow, TextMark,
         },
     },
 };
@@ -156,11 +156,7 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &mdast::Node, cx: &mut NodeC
         }
         Node::InlineMath(raw) => {
             text = raw.value.clone();
-            paragraph.push_image(ImageNode {
-                url: "https://pic.mengh04.top/test.svg".into(),
-                alt: Some(format!("${}$", text).into()),
-                ..Default::default()
-            });
+            paragraph.push(InlineNode::math(MathNode::new(text.clone(), false, span)));
         }
         Node::MdxTextExpression(raw) => {
             text = raw.value.clone();
@@ -336,24 +332,11 @@ fn ast_to_node(
                 span: new_span(val.position, cx),
             }
         }
-        Node::Math(val) => {
-            println!("{:?}", val.value);
-            let mut paragraph = Paragraph::default();
-            paragraph.push_image(ImageNode {
-                url: "https://pic.mengh04.top/test.svg".into(),
-                justify_center: true,
-                // title: raw.title.clone().map(|t| t.into()),
-                // alt: Some(raw.alt.clone().into()),
-                ..Default::default()
-            });
-            BlockNode::Paragraph(paragraph)
-        }
-        // BlockNode::CodeBlock(CodeBlock::new(
-        //     val.value.into(),
-        //     None,
-        //     highlight_theme,
-        //     new_span(val.position, cx),
-        // )),
+        Node::Math(val) => BlockNode::Math(MathNode::new(
+            val.value.clone(),
+            true,
+            new_span(val.position, cx),
+        )),
         Node::Html(val) => match super::html::parse(&val.value, cx) {
             Ok(el) => BlockNode::Root {
                 children: el.blocks,

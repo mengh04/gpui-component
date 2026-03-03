@@ -1,6 +1,8 @@
 mod document;
 mod format;
 mod inline;
+#[cfg(feature = "math")]
+pub mod math_renderer;
 mod node;
 mod state;
 mod style;

@@ -27,6 +27,19 @@ use crate::{
 
 use super::{TextViewStyle, utils::list_item_prefix};
 
+/// Callback type for rendering math (LaTeX) formulas.
+///
+/// The callback receives:
+/// - `&str`: the LaTeX source text
+/// - `bool`: whether this is display mode (`$$...$$`) vs inline (`$...$`)
+/// - `&mut Window`: the GPUI window context
+/// - `&mut App`: the GPUI app context
+///
+/// Returns `Option<AnyElement>` — `Some(element)` with the rendered result,
+/// or `None` to fall back to displaying the raw LaTeX source as inline code.
+pub type MathRendererFn =
+    dyn Fn(&str, bool, &mut Window, &mut App) -> Option<AnyElement> + Send + Sync;
+
 /// The block-level nodes.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BlockNode {
@@ -59,6 +72,8 @@ pub(crate) enum BlockNode {
         span: Option<Span>,
     },
     CodeBlock(CodeBlock),
+    /// A block-level math formula (`$$...$$`).
+    Math(MathNode),
     Table(Table),
     Break {
         html: bool,
@@ -104,6 +119,7 @@ impl BlockNode {
             BlockNode::List { span, .. } => *span,
             BlockNode::ListItem { span, .. } => *span,
             BlockNode::CodeBlock(code_block) => code_block.span,
+            BlockNode::Math(math) => math.span,
             BlockNode::Table(table) => table.span,
             BlockNode::Break { span, .. } => *span,
             BlockNode::Divider { span, .. } => *span,
@@ -187,6 +203,13 @@ impl BlockNode {
                     text.push('\n');
                 }
             }
+            BlockNode::Math(math) => {
+                let block_text = math.text.to_string();
+                if !block_text.is_empty() {
+                    text.push_str(&block_text);
+                    text.push('\n');
+                }
+            }
             BlockNode::Definition { .. }
             | BlockNode::Break { .. }
             | BlockNode::Divider { .. }
@@ -255,6 +278,80 @@ impl From<Span> for ElementId {
     }
 }
 
+/// A math formula node, used for both inline (`$...$`) and display (`$$...$$`) math.
+///
+/// The actual rendering is delegated to a user-provided [`MathRendererFn`] callback
+/// injected via [`NodeContext::math_renderer`]. If no callback is provided (or it
+/// returns `None`), the raw LaTeX source is displayed as a fallback inline-code span.
+#[derive(Debug, Clone)]
+pub struct MathNode {
+    /// The raw LaTeX source text (without delimiters).
+    pub text: SharedString,
+    /// Whether this is display-mode math (`$$...$$` / block-level).
+    pub display: bool,
+    /// Span in the original source document.
+    pub span: Option<Span>,
+}
+
+impl PartialEq for MathNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text && self.display == other.display
+    }
+}
+
+impl MathNode {
+    /// Create a new MathNode.
+    pub fn new(text: impl Into<SharedString>, display: bool, span: Option<Span>) -> Self {
+        Self {
+            text: text.into(),
+            display,
+            span,
+        }
+    }
+
+    /// Render this math node.
+    ///
+    /// Resolution order:
+    /// 1. Built-in renderer (when the `math` feature is enabled) — calls
+    ///    [`super::math_renderer::render_math_to_element`].
+    /// 2. User-provided callback via [`NodeContext::math_renderer`].
+    /// 3. Fallback: display the raw LaTeX source as monospace inline code.
+    pub(crate) fn render(
+        &self,
+        node_cx: &NodeContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        // 1. Try the built-in math renderer (feature-gated).
+        #[cfg(feature = "math")]
+        {
+            if let Some(element) =
+                super::math_renderer::render_math_to_element(&self.text, self.display, window, cx)
+            {
+                return element;
+            }
+        }
+
+        // 2. Try the user-provided renderer callback.
+        if let Some(renderer) = &node_cx.math_renderer {
+            if let Some(element) = renderer(&self.text, self.display, window, cx) {
+                return element;
+            }
+        }
+
+        // 3. Fallback: render as inline code (monospace, accent background).
+        let text = self.text.clone();
+        div()
+            .px_1()
+            .rounded_sm()
+            .bg(cx.theme().accent)
+            .text_size(rems(0.85))
+            .font_family("monospace")
+            .child(text)
+            .into_any_element()
+    }
+}
+
 #[allow(unused)]
 #[derive(Debug, Default, Clone)]
 pub struct ImageNode {
@@ -293,6 +390,8 @@ pub(crate) struct InlineNode {
     /// The text content.
     pub(crate) text: SharedString,
     pub(crate) image: Option<ImageNode>,
+    /// An inline math formula (`$...$`).
+    pub(crate) math: Option<MathNode>,
     /// The text styles, each tuple contains the range of the text and the style.
     pub(crate) marks: Vec<(Range<usize>, TextMark)>,
 
@@ -301,7 +400,10 @@ pub(crate) struct InlineNode {
 
 impl PartialEq for InlineNode {
     fn eq(&self, other: &Self) -> bool {
-        self.text == other.text && self.image == other.image && self.marks == other.marks
+        self.text == other.text
+            && self.image == other.image
+            && self.math == other.math
+            && self.marks == other.marks
     }
 }
 
@@ -310,6 +412,7 @@ impl InlineNode {
         Self {
             text: text.into(),
             image: None,
+            math: None,
             marks: vec![],
             state: Arc::new(Mutex::new(InlineState::default())),
         }
@@ -318,6 +421,12 @@ impl InlineNode {
     pub(crate) fn image(image: ImageNode) -> Self {
         let mut this = Self::new("");
         this.image = Some(image);
+        this
+    }
+
+    pub(crate) fn math(math: MathNode) -> Self {
+        let mut this = Self::new("");
+        this.math = Some(math);
         this
     }
 
@@ -593,6 +702,9 @@ pub(crate) struct NodeContext {
     pub(crate) link_refs: HashMap<SharedString, LinkMark>,
     pub(crate) style: TextViewStyle,
     pub(crate) code_block_actions: Option<Arc<CodeBlockActionsFn>>,
+    /// Optional callback for rendering math (LaTeX) formulas.
+    /// Injected by the user via `TextView::math_renderer(...)`.
+    pub(crate) math_renderer: Option<Arc<MathRendererFn>>,
 }
 
 impl NodeContext {
@@ -604,17 +716,13 @@ impl NodeContext {
 impl PartialEq for NodeContext {
     fn eq(&self, other: &Self) -> bool {
         self.link_refs == other.link_refs && self.style == other.style
-        // Note: code_block_buttons is intentionally not compared (closures can't be compared)
+        // Note: code_block_buttons and math_renderer are intentionally not compared
+        // (closures can't be compared)
     }
 }
 
 impl Paragraph {
-    fn render(
-        &self,
-        node_cx: &NodeContext,
-        _window: &mut Window,
-        cx: &mut App,
-    ) -> impl IntoElement {
+    fn render(&self, node_cx: &NodeContext, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let span = self.span;
         let children = &self.children;
 
@@ -625,28 +733,42 @@ impl Paragraph {
         let mut links: Vec<(Range<usize>, LinkMark)> = vec![];
         let mut offset = 0;
 
+        // Helper closure: flush accumulated text into an Inline element.
+        let flush_text = |text: &mut String,
+                          links: &mut Vec<(Range<usize>, LinkMark)>,
+                          highlights: &mut Vec<(Range<usize>, HighlightStyle)>,
+                          offset: &mut usize,
+                          state: &Arc<Mutex<InlineState>>,
+                          ix: usize,
+                          child_nodes: &mut Vec<AnyElement>| {
+            if !text.is_empty() {
+                state.lock().unwrap().set_text(text.clone().into());
+                child_nodes.push(
+                    Inline::new(ix, state.clone(), links.clone(), highlights.clone())
+                        .into_any_element(),
+                );
+                text.clear();
+                links.clear();
+                highlights.clear();
+                *offset = 0;
+            }
+        };
+
         let mut ix = 0;
         for inline_node in children {
             let text_len = inline_node.text.len();
             text.push_str(&inline_node.text);
 
             if let Some(image) = &inline_node.image {
-                if text.len() > 0 {
-                    inline_node
-                        .state
-                        .lock()
-                        .unwrap()
-                        .set_text(text.clone().into());
-                    child_nodes.push(
-                        Inline::new(
-                            ix,
-                            inline_node.state.clone(),
-                            links.clone(),
-                            highlights.clone(),
-                        )
-                        .into_any_element(),
-                    );
-                }
+                flush_text(
+                    &mut text,
+                    &mut links,
+                    &mut highlights,
+                    &mut offset,
+                    &inline_node.state,
+                    ix,
+                    &mut child_nodes,
+                );
                 let img_el = img(image.url.clone())
                     .id(ix)
                     .object_fit(ObjectFit::Contain)
@@ -676,11 +798,17 @@ impl Paragraph {
                 } else {
                     child_nodes.push(img_el.into_any_element());
                 }
-
-                text.clear();
-                links.clear();
-                highlights.clear();
-                offset = 0;
+            } else if let Some(math) = &inline_node.math {
+                flush_text(
+                    &mut text,
+                    &mut links,
+                    &mut highlights,
+                    &mut offset,
+                    &inline_node.state,
+                    ix,
+                    &mut child_nodes,
+                );
+                child_nodes.push(math.render(node_cx, window, cx));
             } else {
                 let mut node_highlights = vec![];
                 for (range, style) in &inline_node.marks {
@@ -919,6 +1047,13 @@ impl BlockNode {
                     format!("[{}]: {} \"{}\"", identifier, url, title)
                 } else {
                     format!("[{}]: {}", identifier, url)
+                }
+            }
+            BlockNode::Math(math) => {
+                if math.display {
+                    format!("$$\n{}\n$$", math.text)
+                } else {
+                    format!("${}$", math.text)
                 }
             }
             BlockNode::Unknown { .. } => "".to_string(),
@@ -1166,6 +1301,15 @@ impl BlockNode {
                 .id(("p", ix))
                 .pb(mb)
                 .child(paragraph.render(node_cx, window, cx))
+                .into_any_element(),
+            BlockNode::Math(math_node) => div()
+                .id(("math", ix))
+                .pb(mb)
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(math_node.render(node_cx, window, cx))
                 .into_any_element(),
             BlockNode::Heading {
                 level, children, ..

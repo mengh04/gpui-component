@@ -18,6 +18,9 @@ use crate::{global_state::GlobalState, text::TextViewStyle};
 pub(crate) type CodeBlockActionsFn =
     dyn Fn(&CodeBlock, &mut Window, &mut App) -> AnyElement + Send + Sync;
 
+/// Re-export the math renderer function type from node module.
+pub use crate::text::node::MathRendererFn;
+
 /// A text view that can render Markdown or HTML.
 ///
 /// ## Goals
@@ -45,6 +48,7 @@ pub struct TextView {
     selectable: bool,
     scrollable: bool,
     code_block_actions: Option<Arc<CodeBlockActionsFn>>,
+    math_renderer: Option<Arc<MathRendererFn>>,
 }
 
 impl Styled for TextView {
@@ -66,6 +70,7 @@ impl TextView {
             selectable: false,
             scrollable: false,
             code_block_actions: None,
+            math_renderer: None,
         }
     }
 
@@ -81,6 +86,7 @@ impl TextView {
             selectable: false,
             scrollable: false,
             code_block_actions: None,
+            math_renderer: None,
         }
     }
 
@@ -96,6 +102,7 @@ impl TextView {
             selectable: false,
             scrollable: false,
             code_block_actions: None,
+            math_renderer: None,
         }
     }
 
@@ -140,6 +147,23 @@ impl TextView {
         self.code_block_actions = Some(Arc::new(move |code_block, window, cx| {
             f(&code_block, window, cx).into_any_element()
         }));
+        self
+    }
+
+    /// Set a custom renderer for math (LaTeX) formulas.
+    ///
+    /// The closure receives:
+    /// - `&str`: the raw LaTeX source (without `$` delimiters)
+    /// - `bool`: `true` for display mode (`$$...$$`), `false` for inline (`$...$`)
+    /// - `&mut Window` and `&mut App`: GPUI contexts
+    ///
+    /// Return `Some(element)` with the rendered math, or `None` to fall back
+    /// to displaying the raw LaTeX as inline code.
+    pub fn math_renderer<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&str, bool, &mut Window, &mut App) -> Option<AnyElement> + Send + Sync + 'static,
+    {
+        self.math_renderer = Some(Arc::new(f));
         self
     }
 }
@@ -199,6 +223,7 @@ impl Element for TextView {
 
         state.update(cx, |state, cx| {
             state.code_block_actions = self.code_block_actions.clone();
+            state.math_renderer = self.math_renderer.clone();
             state.selectable = self.selectable;
             state.scrollable = self.scrollable;
             state.text_view_style = self.text_view_style.clone();

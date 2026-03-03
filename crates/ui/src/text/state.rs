@@ -1,8 +1,5 @@
-use std::{
-    pin::Pin,
-    task::Poll,
-};
 use futures::Stream as _;
+use std::{pin::Pin, task::Poll};
 
 use gpui::{
     App, AppContext as _, Bounds, ClipboardItem, Context, FocusHandle, IntoElement, KeyBinding,
@@ -12,11 +9,11 @@ use gpui::{
 
 use crate::{
     ActiveTheme, ElementExt,
-    async_util::{Sender, Receiver, unbounded},
+    async_util::{Receiver, Sender, unbounded},
     highlighter::HighlightTheme,
     input::{self, Copy},
     text::{
-        CodeBlockActionsFn, TextViewStyle,
+        CodeBlockActionsFn, MathRendererFn, TextViewStyle,
         document::ParsedDocument,
         format,
         node::{self, NodeContext},
@@ -55,6 +52,7 @@ pub struct TextViewState {
     pub(super) scrollable: bool,
     pub(super) text_view_style: TextViewStyle,
     pub(super) code_block_actions: Option<std::sync::Arc<CodeBlockActionsFn>>,
+    pub(super) math_renderer: Option<std::sync::Arc<MathRendererFn>>,
 
     pub(super) is_selecting: bool,
     /// The local (in TextView) position of the selection.
@@ -116,6 +114,7 @@ impl TextViewState {
             list_state: ListState::new(0, gpui::ListAlignment::Top, px(1000.)),
             text_view_style: TextViewStyle::default(),
             code_block_actions: None,
+            math_renderer: None,
             is_selecting: false,
             parsed_content: Default::default(),
             parsed_error: None,
@@ -278,6 +277,7 @@ impl Render for TextViewState {
         let mut node_cx = self.parsed_content.node_cx.clone();
 
         node_cx.code_block_actions = self.code_block_actions.clone();
+        node_cx.math_renderer = self.math_renderer.clone();
         node_cx.style = self.text_view_style.clone();
 
         v_flex()
@@ -385,7 +385,10 @@ struct UpdateOptions {
     highlight_theme: std::sync::Arc<HighlightTheme>,
 }
 
-fn parse_content(format: TextViewFormat, options: &UpdateOptions) -> Result<ParsedContent, SharedString> {
+fn parse_content(
+    format: TextViewFormat,
+    options: &UpdateOptions,
+) -> Result<ParsedContent, SharedString> {
     let mut node_cx = NodeContext {
         ..NodeContext::default()
     };
