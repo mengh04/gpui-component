@@ -1,6 +1,6 @@
 use gpui::SharedString;
 use markdown::{
-    ParseOptions,
+    Constructs, ParseOptions,
     mdast::{self, Node},
 };
 
@@ -23,7 +23,15 @@ pub(crate) fn parse(
     cx: &mut NodeContext,
     highlight_theme: &HighlightTheme,
 ) -> Result<ParsedDocument, SharedString> {
-    markdown::to_mdast(&source, &ParseOptions::gfm())
+    let parse_options = ParseOptions {
+        constructs: Constructs {
+            math_flow: true,
+            math_text: true,
+            ..Constructs::gfm()
+        },
+        ..ParseOptions::gfm()
+    };
+    markdown::to_mdast(&source, &parse_options)
         .map(|n| ast_to_document(source, n, cx, highlight_theme))
         .map_err(|e| e.to_string().into())
 }
@@ -148,9 +156,11 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &mdast::Node, cx: &mut NodeC
         }
         Node::InlineMath(raw) => {
             text = raw.value.clone();
-            paragraph.push(
-                InlineNode::new(&text).marks(vec![(0..text.len(), TextMark::default().code())]),
-            );
+            paragraph.push_image(ImageNode {
+                url: "https://pic.mengh04.top/test.svg".into(),
+                alt: Some(format!("${}$", text).into()),
+                ..Default::default()
+            });
         }
         Node::MdxTextExpression(raw) => {
             text = raw.value.clone();
@@ -326,12 +336,24 @@ fn ast_to_node(
                 span: new_span(val.position, cx),
             }
         }
-        Node::Math(val) => BlockNode::CodeBlock(CodeBlock::new(
-            val.value.into(),
-            None,
-            highlight_theme,
-            new_span(val.position, cx),
-        )),
+        Node::Math(val) => {
+            println!("{:?}", val.value);
+            let mut paragraph = Paragraph::default();
+            paragraph.push_image(ImageNode {
+                url: "https://pic.mengh04.top/test.svg".into(),
+                justify_center: true,
+                // title: raw.title.clone().map(|t| t.into()),
+                // alt: Some(raw.alt.clone().into()),
+                ..Default::default()
+            });
+            BlockNode::Paragraph(paragraph)
+        }
+        // BlockNode::CodeBlock(CodeBlock::new(
+        //     val.value.into(),
+        //     None,
+        //     highlight_theme,
+        //     new_span(val.position, cx),
+        // )),
         Node::Html(val) => match super::html::parse(&val.value, cx) {
             Ok(el) => BlockNode::Root {
                 children: el.blocks,

@@ -1,3 +1,5 @@
+extern crate markup5ever_rcdom as rcdom;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -335,6 +337,7 @@ fn parse_paragraph(
                     width,
                     height,
                     title: title.map(Into::into),
+                    ..Default::default()
                 });
             }
             _ => {
@@ -444,6 +447,7 @@ fn parse_node(
                     alt: alt.map(Into::into),
                     width,
                     height,
+                    ..Default::default()
                 });
 
                 if children.len() > 0 {

@@ -264,6 +264,7 @@ pub struct ImageNode {
     pub alt: Option<SharedString>,
     pub width: Option<DefiniteLength>,
     pub height: Option<DefiniteLength>,
+    pub justify_center: bool,
 }
 
 impl ImageNode {
@@ -283,6 +284,7 @@ impl PartialEq for ImageNode {
             && self.alt == other.alt
             && self.width == other.width
             && self.height == other.height
+            && self.justify_center == other.justify_center
     }
 }
 
@@ -645,25 +647,35 @@ impl Paragraph {
                         .into_any_element(),
                     );
                 }
-                child_nodes.push(
-                    img(image.url.clone())
-                        .id(ix)
-                        .object_fit(ObjectFit::Contain)
-                        .max_w(relative(1.))
-                        .when_some(image.width, |this, width| this.w(width))
-                        .when_some(image.link.clone(), |this, link| {
-                            let title = image.title();
-                            this.cursor_pointer()
-                                .tooltip(move |window, cx| {
-                                    Tooltip::new(title.clone()).build(window, cx)
-                                })
-                                .on_click(move |_, _, cx| {
-                                    cx.stop_propagation();
-                                    cx.open_url(&link.url);
-                                })
-                        })
-                        .into_any_element(),
-                );
+                let img_el = img(image.url.clone())
+                    .id(ix)
+                    .object_fit(ObjectFit::Contain)
+                    .max_w(relative(1.))
+                    .when_some(image.width, |this, width| this.w(width))
+                    .when_some(image.link.clone(), |this, link| {
+                        let title = image.title();
+                        this.cursor_pointer()
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(title.clone()).build(window, cx)
+                            })
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                cx.open_url(&link.url);
+                            })
+                    });
+
+                if image.justify_center {
+                    child_nodes.push(
+                        div()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .child(img_el)
+                            .into_any_element(),
+                    );
+                } else {
+                    child_nodes.push(img_el.into_any_element());
+                }
 
                 text.clear();
                 links.clear();
@@ -724,7 +736,12 @@ impl Paragraph {
                 .push(Inline::new(ix, self.state.clone(), links, highlights).into_any_element());
         }
 
-        div().id(span.unwrap_or_default()).children(child_nodes)
+        div()
+            .id(span.unwrap_or_default())
+            .flex()
+            .flex_wrap()
+            .items_baseline()
+            .children(child_nodes)
     }
 }
 
